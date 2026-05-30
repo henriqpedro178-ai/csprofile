@@ -1,0 +1,17 @@
+{
+  "name": "csstats-scraper",
+  "version": "1.0.0",
+  "description": "Scraper server for csstats.gg — deploy on Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^21.6.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
