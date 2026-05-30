@@ -4,7 +4,6 @@ const puppeteer = require('puppeteer');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Cache simples em memória (15 min por perfil) ───────────────────────
 const cache = new Map();
 const CACHE_TTL = 15 * 60 * 1000;
 
@@ -18,7 +17,6 @@ function setCache(key, data) {
   cache.set(key, { data, ts: Date.now() });
 }
 
-// ── Instância única do browser (reutilizada entre requests) ───────────
 let browser = null;
 async function getBrowser() {
   if (browser) {
@@ -34,12 +32,12 @@ async function getBrowser() {
       '--no-first-run',
       '--no-zygote',
       '--single-process',
+      '--disable-blink-features=AutomationControlled',
     ],
   });
   return browser;
 }
 
-// ── Scraper principal ──────────────────────────────────────────────────
 async function scrapeCsStats(steamid) {
   const cached = getCached(steamid);
   if (cached) return cached;
@@ -48,134 +46,88 @@ async function scrapeCsStats(steamid) {
   const page = await b.newPage();
 
   try {
-    // Headers realistas para passar o Cloudflare
+    // Remove webdriver flag
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'upgrade-insecure-requests': '1',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     });
 
+    console.log(`[scraper] fetching csstats for ${steamid}`);
+
+    // Timeout de 20s — se o Cloudflare bloquear, falha rápido
     await page.goto(`https://csstats.gg/player/${steamid}`, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
+      waitUntil: 'domcontentloaded',
+      timeout: 20000,
     });
 
-    // Espera o conteúdo carregar
-    await page.waitForSelector('body', { timeout: 10000 });
+    // Verifica se foi bloqueado pelo Cloudflare
+    const title = await page.title();
+    console.log(`[scraper] page title: ${title}`);
 
+    if (title.includes('Just a moment') || title.includes('Attention Required')) {
+      throw new Error('CLOUDFLARE_BLOCKED');
+    }
+
+    // Aguarda algum conteúdo real aparecer (máx 10s)
+    await page.waitForFunction(
+      () => document.body.innerText.length > 500,
+      { timeout: 10000 }
+    ).catch(() => {});
+
+    const html = await page.content();
+    console.log(`[scraper] html length: ${html.length}`);
+
+    // Extrai dados via evaluate
     const data = await page.evaluate(() => {
       const result = {
         premier: null,
         bestPremier: null,
         mapRanks: [],
         seasons: [],
-        competitive: null,
+        debug_text: document.body.innerText.slice(0, 500),
       };
 
-      // ── Premier rating atual ──
-      // Procura o número grande de Premier rating
-      const premierEls = [
-        ...document.querySelectorAll('[class*="premier"] [class*="rating"]'),
-        ...document.querySelectorAll('[class*="rating"][class*="premier"]'),
-        ...document.querySelectorAll('.cs2rating'),
-        ...document.querySelectorAll('[data-cs2rating]'),
-      ];
-      for (const el of premierEls) {
-        const txt = el.textContent.replace(/,/g, '').trim();
+      // Procura todos os números entre 1000-50000 em elementos visíveis
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        null,
+        false
+      );
+      const candidates = [];
+      let node;
+      while ((node = walker.nextNode())) {
+        const txt = node.textContent.replace(/,/g, '').trim();
         const num = parseInt(txt);
-        if (num > 1000 && num < 50000) { result.premier = num; break; }
-      }
-
-      // Fallback: procura qualquer número entre 1000-50000 em elementos de rank
-      if (!result.premier) {
-        const allEls = document.querySelectorAll(
-          '[class*="rank"], [class*="rating"], [class*="elo"], [class*="premier"]'
-        );
-        for (const el of allEls) {
-          const txt = el.textContent.replace(/,/g, '').replace(/\s/g, '');
-          const num = parseInt(txt);
-          if (num >= 1000 && num <= 50000) { result.premier = num; break; }
+        if (num >= 1000 && num <= 50000 && txt === String(num)) {
+          const parent = node.parentElement;
+          const cls = (parent?.className || '') + ' ' + (parent?.parentElement?.className || '');
+          candidates.push({ num, cls: cls.toLowerCase(), txt });
         }
       }
 
-      // ── Best Premier (maior rank histórico) ──
-      const bestEls = document.querySelectorAll(
-        '[class*="best"], [class*="highest"], [class*="peak"]'
-      );
-      for (const el of bestEls) {
-        const txt = el.textContent.replace(/,/g, '').trim();
-        const num = parseInt(txt);
-        if (num >= 1000 && num <= 50000) { result.bestPremier = num; break; }
+      // Premier: procura classe com "premier", "rating", "rank", "cs2"
+      for (const c of candidates) {
+        if (c.cls.match(/premier|cs2rating|cs2-rating/)) {
+          result.premier = c.num; break;
+        }
+      }
+      if (!result.premier && candidates.length) {
+        result.premier = candidates[0].num;
       }
 
-      // ── Ranks por mapa ──
-      // csstats.gg mostra uma tabela/grid de mapas com rank
-      const mapRows = document.querySelectorAll(
-        '[class*="map-row"], [class*="maprow"], [class*="map_row"], tr[data-map], [class*="map-stat"]'
-      );
-      mapRows.forEach(row => {
-        const mapName = row.querySelector('[class*="map-name"], [class*="mapname"], td:first-child')?.textContent?.trim();
-        const rank = row.querySelector('[class*="rank"], [class*="rating"]')?.textContent?.replace(/,/g, '').trim();
-        if (mapName && rank) {
-          const num = parseInt(rank);
-          if (num >= 0) result.mapRanks.push({ map: mapName, rank: num });
-        }
-      });
-
-      // ── Seasons Premier ──
-      const seasonEls = document.querySelectorAll(
-        '[class*="season"], [class*="Season"]'
-      );
-      seasonEls.forEach(el => {
-        const label = el.querySelector('[class*="label"], [class*="name"], span:first-child')?.textContent?.trim();
-        const rating = el.querySelector('[class*="rating"], [class*="rank"], strong')?.textContent?.replace(/,/g, '').trim();
-        if (label && rating) {
-          const num = parseInt(rating);
-          if (num >= 1000 && num <= 50000) result.seasons.push({ season: label, rating: num });
-        }
-      });
-
+      result._candidates = candidates.slice(0, 10);
       return result;
     });
 
-    // Se não encontrou nada com seletores genéricos, tenta parsear o HTML
-    if (!data.premier && !data.mapRanks.length) {
-      const html = await page.content();
-
-      // Procura padrão de Premier rating no HTML bruto
-      const premierMatch = html.match(/(?:premier|cs2)[^>]*?(\d{4,5})(?:\s*<|\s*,)/i);
-      if (premierMatch) data.premier = parseInt(premierMatch[1]);
-
-      // Procura JSON embutido na página (muitos sites colocam window.__data__ ou similar)
-      const jsonMatch = html.match(/window\.__(?:data|state|props|INITIAL_STATE)__\s*=\s*({.+?});/s);
-      if (jsonMatch) {
-        try {
-          const parsed = JSON.parse(jsonMatch[1]);
-          // Tenta extrair dados do JSON embutido
-          const walkJson = (obj, depth = 0) => {
-            if (depth > 5 || !obj || typeof obj !== 'object') return;
-            if (obj.premier_rating || obj.premierRating) {
-              data.premier = obj.premier_rating || obj.premierRating;
-            }
-            if (obj.best_rating || obj.bestRating) {
-              data.bestPremier = obj.best_rating || obj.bestRating;
-            }
-            Object.values(obj).forEach(v => walkJson(v, depth + 1));
-          };
-          walkJson(parsed);
-        } catch (_) {}
-      }
-    }
-
+    console.log(`[scraper] result:`, JSON.stringify(data).slice(0, 300));
     setCache(steamid, data);
     return data;
 
@@ -184,10 +136,8 @@ async function scrapeCsStats(steamid) {
   }
 }
 
-// ── Rotas ──────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Content-Type', 'application/json');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -199,28 +149,24 @@ app.get('/health', (req, res) => {
 
 app.get('/player/:steamid', async (req, res) => {
   const { steamid } = req.params;
-
   if (!/^\d{17}$/.test(steamid)) {
     return res.status(400).json({ error: 'Invalid SteamID64' });
   }
-
   try {
     const data = await scrapeCsStats(steamid);
     res.json({ ok: true, steamid, ...data });
   } catch (err) {
     console.error('[scraper] error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    // Retorna ok:false mas não 500 — o Worker trata graciosamente
+    res.json({ ok: false, error: err.message });
   }
 });
 
-// ── Start ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[csstats-scraper] listening on port ${PORT}`);
-  // Pré-aquece o browser
   getBrowser().then(() => console.log('[csstats-scraper] browser ready'));
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   if (browser) await browser.close();
   process.exit(0);
