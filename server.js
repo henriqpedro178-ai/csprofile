@@ -1,6 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -25,10 +25,10 @@ async function getBrowser() {
   if (browser && browser.connected) return browser;
   console.log('[browser] launching...');
   browser = await puppeteer.launch({
-    args: chromium.args,
-    defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--single-process'],
+    defaultViewport: null,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+    headless: true,
   });
   browser.on('disconnected', () => { browser = null; });
   console.log('[browser] ready');
