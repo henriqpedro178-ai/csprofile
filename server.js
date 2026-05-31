@@ -170,3 +170,22 @@ app.listen(PORT, async () => {
   console.log(`[server] port ${PORT}`);
   await getBrowser().catch(e => console.error('[browser preheat]', e.message));
 });
+
+// ── Debug: retorna HTML bruto da página ───────────────────────────────
+app.get('/debug/:steamid', async (req, res) => {
+  const { steamid } = req.params;
+  if (!/^\d{17}$/.test(steamid)) return res.status(400).json({ error: 'Invalid SteamID64' });
+  const b = await getBrowser();
+  const page = await b.newPage();
+  try {
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.goto(`https://csstats.gg/player/${steamid}`, { waitUntil: 'networkidle2', timeout: 25000 });
+    await new Promise(r => setTimeout(r, 5000));
+    const html = await page.content();
+    const text = await page.evaluate(() => document.body.innerText.slice(0, 3000));
+    res.setHeader('Content-Type', 'application/json');
+    res.json({ htmlLen: html.length, textPreview: text, htmlPreview: html.slice(0, 5000) });
+  } finally {
+    await page.close();
+  }
+});
