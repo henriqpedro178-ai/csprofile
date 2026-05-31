@@ -1,12 +1,13 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Cache simples em memória ──────────────────────────────────────────
 const cache = new Map();
-const CACHE_TTL = 15 * 60 * 1000; // 15 min
+const CACHE_TTL = 15 * 60 * 1000;
 
 function getCached(key) {
   const entry = cache.get(key);
@@ -18,104 +19,63 @@ function setCache(key, data) {
   cache.set(key, { data, ts: Date.now() });
 }
 
-// ── Browser singleton — reutiliza a mesma instância ───────────────────
+// ── Browser singleton ─────────────────────────────────────────────────
 let browser = null;
 async function getBrowser() {
   if (browser && browser.connected) return browser;
-  console.log('[browser] launching puppeteer...');
+  console.log('[browser] launching...');
   browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-extensions',
-    ],
+    args: chromium.args,
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
   });
   browser.on('disconnected', () => { browser = null; });
+  console.log('[browser] ready');
   return browser;
 }
 
-// ── Scraper principal ─────────────────────────────────────────────────
+// ── Scraper ───────────────────────────────────────────────────────────
 async function scrapeCsStats(steamid) {
   const cached = getCached(steamid);
-  if (cached) { console.log(`[scraper] cache hit: ${steamid}`); return cached; }
+  if (cached) { console.log(`[cache hit] ${steamid}`); return cached; }
 
-  const url = `https://csstats.gg/player/${steamid}`;
-  console.log(`[scraper] fetching ${url}`);
-
+  console.log(`[scraper] ${steamid}`);
   const b = await getBrowser();
   const page = await b.newPage();
 
   try {
-    // Bloqueia recursos desnecessários para acelerar
     await page.setRequestInterception(true);
     page.on('request', req => {
-      const type = req.resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
+      if (['image', 'media', 'font', 'stylesheet'].includes(req.resourceType())) req.abort();
+      else req.continue();
     });
 
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 25000 });
+    await page.goto(`https://csstats.gg/player/${steamid}`, {
+      waitUntil: 'networkidle2',
+      timeout: 25000,
+    });
 
-    // Aguarda o SPA renderizar — espera elemento de rating ou timeout de 8s
+    // Aguarda o SPA renderizar
     await page.waitForFunction(
-      () => {
-        // Qualquer elemento que indique que o perfil carregou
-        return (
-          document.querySelector('[class*="cs2rating"]') ||
-          document.querySelector('[class*="premier"]') ||
-          document.querySelector('.player-name') ||
-          document.querySelector('#player-name') ||
-          document.querySelector('[class*="playerName"]') ||
-          document.body.innerText.length > 500
-        );
-      },
+      () => document.body.innerText.length > 500,
       { timeout: 8000 }
-    ).catch(() => console.log('[scraper] waitForFunction timeout, continuing anyway'));
+    ).catch(() => {});
 
-    // Extrai os dados via evaluate (roda no contexto da página)
     const data = await page.evaluate(() => {
-      const result = {
-        premier: null,
-        bestPremier: null,
-        mapRanks: [],
-        seasons: [],
-      };
-
+      const result = { premier: null, bestPremier: null, mapRanks: [], seasons: [] };
       const txt = (el) => el?.textContent?.replace(/,/g, '').trim() || '';
       const num = (s) => { const n = parseInt(s); return n >= 1000 && n <= 50000 ? n : null; };
 
-      // ── Premier atual ──
-      const selectors = [
-        '[class*="cs2rating"]',
-        '[class*="premier"][class*="rating"]',
-        '[class*="rating"][class*="premier"]',
-        '#cs2rating',
-        '[data-rating]',
-        '[class*="Rating"]',
-        '[class*="csrating"]',
-      ];
-      for (const sel of selectors) {
+      // Premier
+      for (const sel of ['[class*="cs2rating"]','[class*="premier"][class*="rating"]','#cs2rating','[data-rating]']) {
         const el = document.querySelector(sel);
-        if (el) {
-          const n = num(txt(el));
-          if (n) { result.premier = n; break; }
-        }
+        if (el) { const n = num(txt(el)); if (n) { result.premier = n; break; } }
       }
-
-      // Fallback TreeWalker
       if (!result.premier) {
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         let node;
@@ -124,97 +84,63 @@ async function scrapeCsStats(steamid) {
           const n = parseInt(t);
           if (t === String(n) && n >= 5000 && n <= 50000) {
             const cls = (node.parentElement?.className || '').toLowerCase();
-            if (cls.match(/rating|rank|premier|cs2/)) {
-              result.premier = n; break;
-            }
+            if (cls.match(/rating|rank|premier|cs2/)) { result.premier = n; break; }
           }
         }
       }
 
-      // ── Best Premier ──
-      document.querySelectorAll('[class*="best"], [class*="peak"], [class*="highest"]').forEach(el => {
+      // Best Premier
+      document.querySelectorAll('[class*="best"],[class*="peak"],[class*="highest"]').forEach(el => {
         if (result.bestPremier) return;
-        const n = num(txt(el));
-        if (n) result.bestPremier = n;
+        const n = num(txt(el)); if (n) result.bestPremier = n;
       });
 
-      // ── Map ranks ──
-      // csstats.gg: div.over → div.icon img (mapa) + div.rank img (rank N.png)
+      // Map ranks
       document.querySelectorAll('div.over').forEach(over => {
         const mapImg  = over.querySelector('div.icon img');
         const rankImg = over.querySelector('div.rank img');
         if (!mapImg || !rankImg) return;
-
         const mapRaw = (mapImg.getAttribute('alt') || mapImg.getAttribute('title') || '').trim();
         if (!mapRaw) return;
-
         const rankMatch = rankImg.getAttribute('src')?.match(/\/ranks\/(\d+)\.png/);
         if (!rankMatch) return;
         const rankNum = parseInt(rankMatch[1]);
         if (isNaN(rankNum) || rankNum < 0 || rankNum > 18) return;
-
-        const mapName = mapRaw
-          .replace(/^(de_|cs_|ar_|dz_)/, '')
-          .replace(/_/g, ' ')
-          .replace(/\b\w/g, ch => ch.toUpperCase());
-
+        const mapName = mapRaw.replace(/^(de_|cs_|ar_|dz_)/,'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
         result.mapRanks.push({ map: mapName, mapKey: mapRaw, rank: rankNum });
       });
 
-      // ── Seasons ──
+      // Seasons
       const seasonPatterns = [/\bSeason\s+\d+\b/i, /\bS\d+\b/, /\b(CS2|Premier)\s+S\d+/i];
-      const isRating = (n) => n >= 1000 && n <= 50000;
+      const isRating = n => n >= 1000 && n <= 50000;
       const seen = new Set();
-
       for (const el of document.querySelectorAll('*')) {
-        const ownText = Array.from(el.childNodes)
-          .filter(n => n.nodeType === 3)
-          .map(n => n.textContent.trim())
-          .join(' ').trim();
-
-        if (!ownText || !seasonPatterns.some(p => p.test(ownText))) continue;
-
-        const candidates = [
-          el, el.parentElement,
-          el.nextElementSibling, el.previousElementSibling,
-          el.parentElement?.nextElementSibling,
-          el.parentElement?.previousElementSibling,
-          ...(el.parentElement?.children || []),
-        ];
-
+        const ownText = Array.from(el.childNodes).filter(n=>n.nodeType===3).map(n=>n.textContent.trim()).join(' ').trim();
+        if (!ownText || !seasonPatterns.some(p=>p.test(ownText))) continue;
+        const candidates = [el,el.parentElement,el.nextElementSibling,el.previousElementSibling,el.parentElement?.nextElementSibling,el.parentElement?.previousElementSibling,...(el.parentElement?.children||[])];
         let rating = null;
         for (const c of candidates) {
           if (!c) continue;
-          const t2 = c.textContent.replace(/,/g, '').trim();
-          const n2 = parseInt(t2);
-          if (isRating(n2)) { rating = n2; break; }
-          for (const child of (c.children || [])) {
-            const t3 = child.textContent.replace(/,/g, '').trim();
-            const n3 = parseInt(t3);
-            if (isRating(n3)) { rating = n3; break; }
-          }
+          const n = parseInt(c.textContent.replace(/,/g,'').trim());
+          if (isRating(n)) { rating = n; break; }
+          for (const child of c.children||[]) { const n2=parseInt(child.textContent.replace(/,/g,'').trim()); if(isRating(n2)){rating=n2;break;} }
           if (rating) break;
         }
-
-        if (rating && !seen.has(ownText)) {
-          seen.add(ownText);
-          result.seasons.push({ season: ownText, rating });
-        }
+        if (rating && !seen.has(ownText)) { seen.add(ownText); result.seasons.push({ season: ownText, rating }); }
       }
 
       return result;
     });
 
-    console.log(`[scraper] result for ${steamid}:`, JSON.stringify(data));
+    console.log(`[scraper] done:`, JSON.stringify(data));
     setCache(steamid, data);
     return data;
-
   } finally {
     await page.close();
   }
 }
 
-// ── Middleware CORS ───────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
@@ -229,23 +155,18 @@ app.get('/health', (req, res) => {
 
 app.get('/player/:steamid', async (req, res) => {
   const { steamid } = req.params;
-  if (!/^\d{17}$/.test(steamid)) {
-    return res.status(400).json({ error: 'Invalid SteamID64' });
-  }
+  if (!/^\d{17}$/.test(steamid)) return res.status(400).json({ error: 'Invalid SteamID64' });
   try {
     const data = await scrapeCsStats(steamid);
     res.json({ ok: true, steamid, ...data });
   } catch (err) {
-    console.error('[scraper] error:', err.message);
-    const blocked = err.message === 'CLOUDFLARE_BLOCKED';
-    res.status(blocked ? 503 : 500).json({ ok: false, error: err.message });
+    console.error('[error]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`[csstats-scraper] listening on port ${PORT}`);
-  // Pré-aquece o browser pra primeira requisição ser mais rápida
-  await getBrowser().catch(e => console.error('[browser] preheat failed:', e.message));
-  console.log('[browser] ready');
+  console.log(`[server] port ${PORT}`);
+  await getBrowser().catch(e => console.error('[browser preheat]', e.message));
 });
